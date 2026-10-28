@@ -1,0 +1,13 @@
+{
+  // Use the same Worker name you already deploy (your address starts with "sheirleyshop.").
+  "name": "sheirleyshop",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-28",
+  "assets": {
+    // The folder that holds index.html, privacy.html, etc.
+    "directory": "./public",
+    "binding": "ASSETS",
+    // Without this, Cloudflare serves the files directly and the Worker never sees the page request.
+    "run_worker_first": true
+  }
+}
