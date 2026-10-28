@@ -2,4 +2,4 @@
 
 Online shop.
 
-Visit: https://sheirleyshop.vercel.app
+Visit: https://sheirleyshop.sheirley.workers.dev
