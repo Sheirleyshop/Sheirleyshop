@@ -11648,12 +11648,28 @@ function ovEnsureThreshold(){
   }
 
   // keep the button just above the Customer Service button when that one is showing, and low when it is hidden
+  var panelBottom = 120;
   function placeFab(){
     var shown = supportFab && supportFab.style.display !== "none" && getComputedStyle(supportFab).display !== "none";
     var bottom = shown ? 68 : 16;
     fab.style.bottom = bottom + "px";
-    panel.style.bottom = (bottom + 52) + "px";
+    panelBottom = bottom + 52;
+    fitPanel();
   }
+  // when the phone keyboard is open, sit just above it (and shrink if needed) so the typing box is never hidden
+  var vv = window.visualViewport, fitRaf = 0;
+  function fitPanel(){
+    var kb = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+    if(kb > 80){
+      panel.style.bottom = (kb + 8) + "px";
+      panel.style.height = Math.max(200, Math.min(460, vv.height - 16)) + "px";
+    }else{
+      panel.style.bottom = panelBottom + "px";
+      panel.style.height = "";
+    }
+  }
+  function scheduleFit(){ if(!fitRaf) fitRaf = requestAnimationFrame(function(){ fitRaf = 0; fitPanel(); }); }
+  if(vv){ vv.addEventListener("resize", scheduleFit); vv.addEventListener("scroll", scheduleFit); }
   placeFab();
   if(supportFab && window.MutationObserver){ new MutationObserver(placeFab).observe(supportFab, { attributes: true, attributeFilter: ["style", "class"] }); }
 
