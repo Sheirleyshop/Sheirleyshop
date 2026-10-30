@@ -11585,5 +11585,123 @@ function ovEnsureThreshold(){
   window.addEventListener("pageshow", function(){ busy = false; pulling = false; dist = 0; body.style.transition = ""; body.style.transform = ""; ind.classList.remove("spin"); ind.style.opacity = 0; ind.style.top = "-60px"; });
 })();
 </script>
+
+<!-- ===== SHEIRLEY AI assistant (talks only to this site's own /api/chat; the Gemini key lives in Cloudflare, never here) ===== -->
+<style>
+  #aiFab{ position:fixed; left:16px; bottom:68px; z-index:85; width:42px; height:42px; border-radius:50%; border:none; cursor:pointer;
+    background:var(--primary); color:var(--primary-ink,#fff); box-shadow:0 6px 16px rgba(0,0,0,.16); display:flex; align-items:center; justify-content:center; }
+  #aiPanel{ position:fixed; left:12px; bottom:120px; z-index:86; width:min(360px, calc(100vw - 24px)); height:min(460px, calc(100vh - 150px)); height:min(460px, calc(100dvh - 150px));
+    display:none; flex-direction:column; background:var(--panel); color:var(--text); border:1.5px solid var(--outline); border-radius:16px; overflow:hidden;
+    box-shadow:0 12px 36px rgba(0,0,0,.22); font-family:var(--sans); }
+  #aiPanel.open{ display:flex; }
+  #aiHead{ display:flex; align-items:center; justify-content:space-between; gap:8px; padding:11px 14px; background:var(--primary); color:var(--primary-ink,#fff); font-weight:700; font-size:.9rem; }
+  #aiClose{ background:transparent; border:none; color:inherit; cursor:pointer; font-size:1.3rem; line-height:1; padding:0 4px; }
+  #aiLog{ flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; padding:12px; display:flex; flex-direction:column; gap:8px; background:var(--bg-soft); }
+  .aiMsg{ max-width:85%; padding:9px 13px; border-radius:14px; font-size:.86rem; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
+  .aiMsg.bot{ align-self:flex-start; background:var(--panel); border:1px solid var(--outline); border-bottom-left-radius:4px; }
+  .aiMsg.me{ align-self:flex-end; background:var(--primary); color:var(--primary-ink,#fff); border-bottom-right-radius:4px; }
+  .aiMsg.err{ align-self:flex-start; background:var(--panel); border:1px dashed var(--outline); color:var(--muted); border-bottom-left-radius:4px; }
+  #aiNote{ padding:6px 12px; font-size:.7rem; color:var(--muted); border-top:1px solid var(--outline); background:var(--panel); }
+  #aiForm{ display:flex; gap:8px; padding:10px 12px; background:var(--panel); border-top:1px solid var(--outline); }
+  #aiInput{ flex:1; min-width:0; font-size:16px; font-family:inherit; border:1px solid var(--outline); border-radius:10px; padding:10px 12px; background:var(--bg-soft); color:var(--text); outline:none; }
+  #aiSend{ flex-shrink:0; border:none; border-radius:10px; padding:0 16px; background:var(--primary); color:var(--primary-ink,#fff); font-weight:700; font-family:inherit; cursor:pointer; }
+  #aiSend:disabled{ opacity:.5; cursor:default; }
+</style>
+<button id="aiFab" type="button" title="Ask our assistant" aria-label="Ask our assistant" aria-expanded="false" aria-controls="aiPanel">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>
+</button>
+<div id="aiPanel" role="dialog" aria-label="SHEIRLEY Assistant">
+  <div id="aiHead"><span>SHEIRLEY Assistant</span><button id="aiClose" type="button" aria-label="Close">&times;</button></div>
+  <div id="aiLog" aria-live="polite"></div>
+  <div id="aiNote">AI assistant, can make mistakes. For orders or anything urgent, please use Customer Service chat. / এআই অ্যাসিস্ট্যান্ট ভুল করতে পারে। অর্ডার বা জরুরি বিষয়ে কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।</div>
+  <form id="aiForm" autocomplete="off">
+    <input id="aiInput" type="text" maxlength="500" placeholder="Ask a question…" aria-label="Your question">
+    <button id="aiSend" type="submit">Send</button>
+  </form>
+</div>
+<script>
+(function(){
+  "use strict";
+  var fab = document.getElementById("aiFab"), panel = document.getElementById("aiPanel"), log = document.getElementById("aiLog"),
+      form = document.getElementById("aiForm"), input = document.getElementById("aiInput"), sendBtn = document.getElementById("aiSend"),
+      closeBtn = document.getElementById("aiClose"), supportFab = document.getElementById("supportFab");
+  if(!fab || !panel || !log || !form || !input || !sendBtn) return;
+
+  var history = [];            // what has been said so far (kept only on this page, never saved)
+  var busy = false;
+  var GREETING = "Hello! I can help with our products, prices, delivery and payment. / আসসালামু আলাইকুম! আমি পণ্য, দাম, ডেলিভারি ও পেমেন্ট নিয়ে সাহায্য করতে পারি।";
+  var FALLBACK_ERR = "Something went wrong. Please try again, or use Customer Service chat. / কিছু একটা সমস্যা হয়েছে। আবার চেষ্টা করুন বা কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।";
+
+  function addBubble(kind, text){
+    var d = document.createElement("div");
+    d.className = "aiMsg " + kind;
+    d.textContent = text;                 // text only: replies can never inject HTML into the page
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+    return d;
+  }
+  function setBusy(b){ busy = b; sendBtn.disabled = b; }
+  function setOpen(open){
+    panel.classList.toggle("open", open);
+    fab.setAttribute("aria-expanded", open ? "true" : "false");
+    if(open){ if(!log.children.length) addBubble("bot", GREETING); setTimeout(function(){ try{ input.focus(); }catch(e){} }, 50); }
+  }
+
+  // keep the button just above the Customer Service button when that one is showing, and low when it is hidden
+  function placeFab(){
+    var shown = supportFab && supportFab.style.display !== "none" && getComputedStyle(supportFab).display !== "none";
+    var bottom = shown ? 68 : 16;
+    fab.style.bottom = bottom + "px";
+    panel.style.bottom = (bottom + 52) + "px";
+  }
+  placeFab();
+  if(supportFab && window.MutationObserver){ new MutationObserver(placeFab).observe(supportFab, { attributes: true, attributeFilter: ["style", "class"] }); }
+
+  fab.addEventListener("click", function(){ setOpen(!panel.classList.contains("open")); });
+  closeBtn.addEventListener("click", function(){ setOpen(false); });
+  document.addEventListener("keydown", function(e){ if(e.key === "Escape" && panel.classList.contains("open")) setOpen(false); });
+
+  form.addEventListener("submit", async function(e){
+    e.preventDefault();
+    if(busy) return;
+    var text = input.value.replace(/\s+/g, " ").trim();
+    if(!text) return;
+    input.value = "";
+    history.push({ role: "user", content: text });
+    addBubble("me", text);
+    var wait = addBubble("bot", "…");
+    setBusy(true);
+    var ac = new AbortController();
+    var timer = setTimeout(function(){ ac.abort(); }, 30000);
+    try{
+      var res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: history.slice(-12) }),
+        signal: ac.signal
+      });
+      var data = null;
+      try{ data = await res.json(); }catch(x){}
+      if(res.ok && data && typeof data.reply === "string" && data.reply){
+        wait.textContent = data.reply;
+        history.push({ role: "assistant", content: data.reply });
+      }else{
+        wait.className = "aiMsg err";
+        wait.textContent = (data && typeof data.message === "string" && data.message) ? data.message : FALLBACK_ERR;
+        history.pop();                    // the unanswered question is not kept, so the next message starts cleanly
+      }
+    }catch(err){
+      wait.className = "aiMsg err";
+      wait.textContent = FALLBACK_ERR;
+      history.pop();
+    }finally{
+      clearTimeout(timer);
+      setBusy(false);
+      log.scrollTop = log.scrollHeight;
+      try{ input.focus(); }catch(x){}
+    }
+  });
+})();
+</script>
 </body>
 </html>
