@@ -57,6 +57,7 @@ async function getShareImage(ctx){
    ===================================================================================================== */
 
 const CHAT_PATH = "/api/chat";
+const CONFIG_PATH = "/api/chat/config";
 const GEMINI_MODEL = "gemini-3.8-flash";        // to switch model later, change only this line
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent";
 const GEMINI_TIMEOUT_MS = 20000;
@@ -73,7 +74,8 @@ const LOCAL_LIMIT_PER_MINUTE = 12;  // backstop used even if the Cloudflare rate
 const MSG_BUSY = "The assistant is busy right now. Please try again in a moment. / অ্যাসিস্ট্যান্ট এখন ব্যস্ত আছে, কিছুক্ষণ পরে আবার চেষ্টা করুন।";
 const MSG_DOWN = "The assistant is not available right now. Please use the customer service chat. / অ্যাসিস্ট্যান্ট এখন পাওয়া যাচ্ছে না, অনুগ্রহ করে কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।";
 const MSG_SLOW = "You are sending messages too quickly. Please wait a little. / আপনি খুব দ্রুত মেসেজ পাঠাচ্ছেন, একটু অপেক্ষা করুন।";
-const MSG_BLOCKED = "Sorry, I can't help with that one. I'm happy to help with our products, delivery or payment. / দুঃখিত, এটি নিয়ে সাহায্য করতে পারছি না। আমাদের পণ্য, ডেলিভারি বা পেমেন্ট নিয়ে প্রশ্ন করতে পারেন।";
+const MSG_OFF = "The assistant is switched off right now. Please use the customer service chat. / অ্যাসিস্ট্যান্ট এখন বন্ধ আছে, অনুগ্রহ করে কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।";
+const MSG_BLOCKED ="Sorry, I can't help with that one. I'm happy to help with our products, delivery or payment. / দুঃখিত, এটি নিয়ে সাহায্য করতে পারছি না। আমাদের পণ্য, ডেলিভারি বা পেমেন্ট নিয়ে প্রশ্ন করতে পারেন।";
 
 function jsonResponse(status, body, extraHeaders){
   const headers = Object.assign({
@@ -169,7 +171,9 @@ function parseMessages(body){
 }
 
 /* ---------- what the assistant knows (public shop data, cached 5 minutes) ---------- */
-let contextCache = { text: "", ok: false, at: 0 };
+// The admin's AI Assistant settings (Dashboard → Settings). Empty name/greeting means "use the built-in default".
+const AI_DEFAULTS = { enabled: true, name: "", greeting: "" };
+let contextCache = { text: "", ok: false, at: 0, ai: AI_DEFAULTS };
 let contextInflight = null;
 
 async function supabaseGet(table, query){
@@ -271,7 +275,8 @@ async function fetchStoreContext(){
     "earnAmount:data->pointsEarnAmount", "earnPoints:data->pointsEarnPoints",
     "redeemPoints:data->pointsRedeemPoints", "redeemValue:data->pointsRedeemValue",
     "maxPct:data->maxPointsDiscountPct", "minPoints:data->minPointsToUse",
-    "faqOn:data->quickRepliesEnabled", "faqs:data->quickReplies"
+    "faqOn:data->quickRepliesEnabled", "faqs:data->quickReplies",
+    "aiEnabled:data->aiAssistantEnabled", "aiName:data->>aiAssistantName", "aiGreeting:data->>aiAssistantGreeting"
   ].join(",");
   const productsQuery = "select=" + [
     "id", "name", "price", "stock", "category", "prev:data->previousPrice", "colors:data->colors", "sizes:data->sizes",
@@ -282,7 +287,12 @@ async function fetchStoreContext(){
     supabaseGet("products", productsQuery)
   ]);
   const settings = (Array.isArray(settingsRows) && settingsRows[0]) || {};
-  return buildContextText(settings, Array.isArray(products) ? products : []);
+  const ai = {
+    enabled: settings.aiEnabled !== false,                              // not set yet = ON, so nothing changes until the admin switches it off
+    name: oneLine(settings.aiName || "", 40),
+    greeting: cleanText(settings.aiGreeting || "").slice(0, 300)
+  };
+  return { text: buildContextText(settings, Array.isArray(products) ? products : []), ai };
 }
 
 async function loadStoreContext(){
@@ -291,13 +301,13 @@ async function loadStoreContext(){
   if(contextInflight) return contextInflight;
   contextInflight = (async () => {
     try{
-      const text = await fetchStoreContext();
-      contextCache = { text, ok: true, at: Date.now() };
+      const fresh = await fetchStoreContext();
+      contextCache = { text: fresh.text, ai: fresh.ai, ok: true, at: Date.now() };
     }catch(e){
       console.error("[chat] could not load shop data:", e && e.message);
       // keep using the last good copy if there is one; otherwise retry in 30 seconds
-      if(contextCache.ok) contextCache = { text: contextCache.text, ok: true, at: Date.now() - CONTEXT_TTL_MS + 30000 };
-      else contextCache = { text: "", ok: false, at: Date.now() - CONTEXT_TTL_MS + 30000 };
+      if(contextCache.ok) contextCache = { text: contextCache.text, ai: contextCache.ai, ok: true, at: Date.now() - CONTEXT_TTL_MS + 30000 };
+      else contextCache = { text: "", ai: AI_DEFAULTS, ok: false, at: Date.now() - CONTEXT_TTL_MS + 30000 };
     }finally{
       contextInflight = null;
     }
@@ -307,8 +317,9 @@ async function loadStoreContext(){
 }
 
 function buildSystemPrompt(ctx){
+  const botName = ((ctx.ai && ctx.ai.name) || "SHEIRLEY Assistant").replace(/"/g, "'");   // the admin's chosen name, from Settings
   const rules = [
-    'You are "SHEIRLEY Assistant", the friendly shopping helper for SHEIRLEY, an online jewelry shop in Bangladesh.',
+    'You are "' + botName + '", the friendly shopping helper for SHEIRLEY, an online jewelry shop in Bangladesh.',
     "",
     "RULES",
     "- Reply in the same language the customer writes in (Bangla, English, or a mix). Keep answers short, usually 2 to 5 sentences. Be warm, polite and never pushy.",
@@ -382,6 +393,7 @@ async function handleChat(request, env){
   if(parsed.error) return jsonResponse(400, { error: "invalid_request", message: parsed.error });
 
   const ctx = await loadStoreContext();
+  if(ctx.ok && ctx.ai.enabled === false) return jsonResponse(503, { error: "disabled", message: MSG_OFF });   // switched off in Dashboard → Settings
   const system = buildSystemPrompt(ctx);
 
   let r;
@@ -414,11 +426,25 @@ async function handleChat(request, env){
   return jsonResponse(200, { reply: reply.slice(0, 2500) });
 }
 
+// GET /api/chat/config: tells the page whether to show the assistant button, and with what name and first message.
+// Only public values are returned (they come from the same public settings the shop page already reads).
+async function handleConfig(request, env){
+  if(request.method !== "GET") return jsonResponse(405, { error: "method_not_allowed" }, { "Allow": "GET" });
+  const ctx = await loadStoreContext();
+  const ai = ctx.ai || AI_DEFAULTS;
+  return jsonResponse(200, {
+    enabled: ai.enabled !== false && !!env.GEMINI_API_KEY,   // no key on the Worker = nothing to offer, so the button stays hidden
+    name: ai.name,
+    greeting: ai.greeting
+  }, { "Cache-Control": "public, max-age=60" });
+}
+
 export default {
   async fetch(request, env, ctx){
-    if(new URL(request.url).pathname === CHAT_PATH){
+    const path = new URL(request.url).pathname;
+    if(path === CHAT_PATH || path === CONFIG_PATH){
       try{
-        return await handleChat(request, env);
+        return path === CHAT_PATH ? await handleChat(request, env) : await handleConfig(request, env);
       }catch(e){
         console.error("[chat] unexpected error:", e && e.message);
         return jsonResponse(500, { error: "server_error", message: MSG_DOWN });

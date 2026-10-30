@@ -2628,6 +2628,13 @@ body{transition:opacity .25s ease}
       <label style="display:flex; align-items:center; gap:10px; margin-bottom:20px; font-size:.9rem;">
         <input type="checkbox" id="setFilterSize"> Size filter
       </label>
+      <p class="sub" style="text-align:left; margin-bottom:6px; font-weight:700; text-transform:uppercase; font-size:.72rem; letter-spacing:.08em; color:var(--text);">AI Assistant</p>
+      <label style="display:flex; align-items:center; gap:10px; margin-bottom:14px; font-size:.9rem;">
+        <input type="checkbox" id="setAiEnabled"> Enabled — show the AI assistant button to customers
+      </label>
+      <div class="field"><label>Assistant name (shown at the top of the chat)</label><input type="text" id="setAiName" maxlength="40" placeholder="SHEIRLEY Assistant"></div>
+      <div class="field"><label>First message (shown when a customer opens the assistant)</label><textarea id="setAiGreeting" maxlength="300" style="min-height:70px;" placeholder="Hello! I can help with our products, prices, delivery and payment."></textarea></div>
+      <p class="sub" style="text-align:left; margin-bottom:20px; font-size:.78rem;">Leave a box empty to use the default. Customers see changes within about 5 minutes. Turning it OFF hides the button and stops the assistant from answering.</p>
       <button class="btn-primary" id="settingsSaveBtn">Save Settings</button>
       <p style="text-align:center; font-size:.72rem; color:var(--muted); margin:14px 0 0;">Site update code: <b id="siteBuildCode"></b> — changes whenever a new version is uploaded</p>
     </div>
@@ -2866,7 +2873,7 @@ body{transition:opacity .25s ease}
   var STORAGE_KEY = "aurelle_store_config_v1";
   // This code changes every time a new index.html is delivered. After an update, every admin and moderator device
   // is signed out once and must log in again (password + current authenticator code). Customers are not affected.
-  var BUILD_ID = "ZM4QF";
+  var BUILD_ID = "Q8T5N";
   var STAFF_BUILD_KEY = "sheirley_staff_build";
   function staffBuildIsCurrent(){ try{ return localStorage.getItem(STAFF_BUILD_KEY) === BUILD_ID; }catch(e){ return false; } }
   function rememberStaffBuild(){ try{ localStorage.setItem(STAFF_BUILD_KEY, BUILD_ID); }catch(e){} }
@@ -10533,6 +10540,9 @@ function ovEnsureThreshold(){
     document.getElementById("setFilterPrice").checked = filterOn("price");
     document.getElementById("setFilterColor").checked = filterOn("color");
     document.getElementById("setFilterSize").checked = filterOn("size");
+    document.getElementById("setAiEnabled").checked = cfg.aiAssistantEnabled !== false;
+    document.getElementById("setAiName").value = cfg.aiAssistantName || "";
+    document.getElementById("setAiGreeting").value = cfg.aiAssistantGreeting || "";
   }
   document.getElementById("settingsSaveBtn").addEventListener("click", function(){
     cfg.starRatingEnabled = document.getElementById("setStarRatingEnabled").checked;
@@ -10555,6 +10565,9 @@ function ovEnsureThreshold(){
       color: document.getElementById("setFilterColor").checked,
       size: document.getElementById("setFilterSize").checked
     };
+    cfg.aiAssistantEnabled = document.getElementById("setAiEnabled").checked;
+    cfg.aiAssistantName = (document.getElementById("setAiName").value || "").trim().slice(0, 40);
+    cfg.aiAssistantGreeting = (document.getElementById("setAiGreeting").value || "").trim().slice(0, 300);
     saveConfig();
     renderProducts();
     updateWriteReviewVisibility();
@@ -11589,7 +11602,8 @@ function ovEnsureThreshold(){
 <!-- ===== SHEIRLEY AI assistant (talks only to this site's own /api/chat; the Gemini key lives in Cloudflare, never here) ===== -->
 <style>
   #aiFab{ position:fixed; left:16px; bottom:68px; z-index:85; width:42px; height:42px; border-radius:50%; border:none; cursor:pointer;
-    background:var(--primary); color:var(--primary-ink,#fff); box-shadow:0 6px 16px rgba(0,0,0,.16); display:flex; align-items:center; justify-content:center; }
+    background:var(--primary); color:var(--primary-ink,#fff); box-shadow:0 6px 16px rgba(0,0,0,.16); display:none; align-items:center; justify-content:center; }
+  #aiFab.ready{ display:flex; }
   #aiPanel{ position:fixed; left:12px; bottom:120px; z-index:86; width:min(360px, calc(100vw - 24px)); height:min(460px, calc(100vh - 150px)); height:min(460px, calc(100dvh - 150px));
     display:none; flex-direction:column; background:var(--panel); color:var(--text); border:1.5px solid var(--outline); border-radius:16px; overflow:hidden;
     box-shadow:0 12px 36px rgba(0,0,0,.22); font-family:var(--sans); }
@@ -11611,7 +11625,7 @@ function ovEnsureThreshold(){
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>
 </button>
 <div id="aiPanel" role="dialog" aria-label="SHEIRLEY Assistant">
-  <div id="aiHead"><span>SHEIRLEY Assistant</span><button id="aiClose" type="button" aria-label="Close">&times;</button></div>
+  <div id="aiHead"><span id="aiTitle">SHEIRLEY Assistant</span><button id="aiClose" type="button" aria-label="Close">&times;</button></div>
   <div id="aiLog" aria-live="polite"></div>
   <div id="aiNote">AI assistant, can make mistakes. For orders or anything urgent, please use Customer Service chat. / এআই অ্যাসিস্ট্যান্ট ভুল করতে পারে। অর্ডার বা জরুরি বিষয়ে কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।</div>
   <form id="aiForm" autocomplete="off">
@@ -11629,7 +11643,7 @@ function ovEnsureThreshold(){
 
   var history = [];            // what has been said so far (kept only on this page, never saved)
   var busy = false;
-  var GREETING = "Hello! I can help with our products, prices, delivery and payment. / আসসালামু আলাইকুম! আমি পণ্য, দাম, ডেলিভারি ও পেমেন্ট নিয়ে সাহায্য করতে পারি।";
+  var greeting = "Hello! I can help with our products, prices, delivery and payment. / আসসালামু আলাইকুম! আমি পণ্য, দাম, ডেলিভারি ও পেমেন্ট নিয়ে সাহায্য করতে পারি।";   // replaced by the admin's First message, if one is set
   var FALLBACK_ERR = "Something went wrong. Please try again, or use Customer Service chat. / কিছু একটা সমস্যা হয়েছে। আবার চেষ্টা করুন বা কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।";
 
   function addBubble(kind, text){
@@ -11644,7 +11658,7 @@ function ovEnsureThreshold(){
   function setOpen(open){
     panel.classList.toggle("open", open);
     fab.setAttribute("aria-expanded", open ? "true" : "false");
-    if(open){ if(!log.children.length) addBubble("bot", GREETING); setTimeout(function(){ try{ input.focus(); }catch(e){} }, 50); }
+    if(open){ if(!log.children.length) addBubble("bot", greeting); setTimeout(function(){ try{ input.focus(); }catch(e){} }, 50); }
   }
 
   // keep the button just above the Customer Service button when that one is showing, and low when it is hidden
@@ -11672,6 +11686,19 @@ function ovEnsureThreshold(){
   if(vv){ vv.addEventListener("resize", scheduleFit); vv.addEventListener("scroll", scheduleFit); }
   placeFab();
   if(supportFab && window.MutationObserver){ new MutationObserver(placeFab).observe(supportFab, { attributes: true, attributeFilter: ["style", "class"] }); }
+
+  // The button stays hidden until the site confirms the assistant is ON (and gives its name and first message).
+  // If it is OFF, or the site can't be reached, it never appears.
+  (async function loadAssistantSettings(){
+    try{
+      var r = await fetch("/api/chat/config", { headers: { "Accept": "application/json" } });
+      var c = r.ok ? await r.json() : null;
+      if(!c || typeof c !== "object" || c.enabled !== true) return;
+      if(typeof c.name === "string" && c.name){ document.getElementById("aiTitle").textContent = c.name; panel.setAttribute("aria-label", c.name); }
+      if(typeof c.greeting === "string" && c.greeting) greeting = c.greeting;
+      fab.classList.add("ready");
+    }catch(e){}
+  })();
 
   fab.addEventListener("click", function(){ setOpen(!panel.classList.contains("open")); });
   closeBtn.addEventListener("click", function(){ setOpen(false); });
@@ -11705,6 +11732,7 @@ function ovEnsureThreshold(){
         wait.className = "aiMsg err";
         wait.textContent = (data && typeof data.message === "string" && data.message) ? data.message : FALLBACK_ERR;
         history.pop();                    // the unanswered question is not kept, so the next message starts cleanly
+        if(data && data.error === "disabled") fab.classList.remove("ready");   // the admin turned it off while this page was open
       }
     }catch(err){
       wait.className = "aiMsg err";
