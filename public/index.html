@@ -2873,7 +2873,7 @@ body{transition:opacity .25s ease}
   var STORAGE_KEY = "aurelle_store_config_v1";
   // This code changes every time a new index.html is delivered. After an update, every admin and moderator device
   // is signed out once and must log in again (password + current authenticator code). Customers are not affected.
-  var BUILD_ID = "Q8T5N";
+  var BUILD_ID = "R4K9M";
   var STAFF_BUILD_KEY = "sheirley_staff_build";
   function staffBuildIsCurrent(){ try{ return localStorage.getItem(STAFF_BUILD_KEY) === BUILD_ID; }catch(e){ return false; } }
   function rememberStaffBuild(){ try{ localStorage.setItem(STAFF_BUILD_KEY, BUILD_ID); }catch(e){} }
@@ -6152,6 +6152,14 @@ body{transition:opacity .25s ease}
     document.getElementById("regError").style.display = "none";
     if(view === "register"){ regViewShownAt = Date.now(); document.getElementById("regAgree").checked = false; syncRegAgree(); }
   }
+  /* tiny read-only bridge for the AI assistant button (a separate script at the bottom of the page): who is logged in, their login token, open the sign-in box */
+  window.__aiAuth = {
+    loggedIn: function(){ return !!currentCustomer; },
+    token: async function(){
+      try{ if(!sb) return null; var r = await sb.auth.getSession(); return (r && r.data && r.data.session && r.data.session.access_token) || null; }catch(e){ return null; }
+    },
+    signIn: function(){ var b = document.getElementById("signInBtn"); if(b) b.click(); }
+  };
   var regViewShownAt = 0;
   document.getElementById("signInBtn").addEventListener("click", function(){
     if(currentCustomer){ openAccountModal(); return; }
@@ -11620,6 +11628,10 @@ function ovEnsureThreshold(){
   #aiInput{ flex:1; min-width:0; font-size:16px; font-family:inherit; border:1px solid var(--outline); border-radius:10px; padding:10px 12px; background:var(--bg-soft); color:var(--text); outline:none; }
   #aiSend{ flex-shrink:0; border:none; border-radius:10px; padding:0 16px; background:var(--primary); color:var(--primary-ink,#fff); font-weight:700; font-family:inherit; cursor:pointer; }
   #aiSend:disabled{ opacity:.5; cursor:default; }
+  #aiLogin{ display:none; flex:1; min-height:0; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:24px 20px; text-align:center; background:var(--bg-soft); font-size:.88rem; line-height:1.5; }
+  #aiLoginBtn{ border:none; border-radius:10px; padding:11px 22px; background:var(--primary); color:var(--primary-ink,#fff); font-weight:700; font-family:inherit; cursor:pointer; }
+  #aiPanel.loggedout #aiLogin{ display:flex; }
+  #aiPanel.loggedout #aiLog, #aiPanel.loggedout #aiForm{ display:none; }
 </style>
 <button id="aiFab" type="button" title="Ask our assistant" aria-label="Ask our assistant" aria-expanded="false" aria-controls="aiPanel">
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>
@@ -11627,6 +11639,10 @@ function ovEnsureThreshold(){
 <div id="aiPanel" role="dialog" aria-label="SHEIRLEY Assistant">
   <div id="aiHead"><span id="aiTitle">SHEIRLEY Assistant</span><button id="aiClose" type="button" aria-label="Close">&times;</button></div>
   <div id="aiLog" aria-live="polite"></div>
+  <div id="aiLogin">
+    <div>Please sign in to chat with our assistant. Only customers with an account can use it.<br>অ্যাসিস্ট্যান্টের সাথে কথা বলতে সাইন ইন করুন। শুধু অ্যাকাউন্ট থাকা কাস্টমাররা ব্যবহার করতে পারবেন।</div>
+    <button id="aiLoginBtn" type="button">Sign in / সাইন ইন</button>
+  </div>
   <div id="aiNote">AI assistant, can make mistakes. For orders or anything urgent, please use Customer Service chat. / এআই অ্যাসিস্ট্যান্ট ভুল করতে পারে। অর্ডার বা জরুরি বিষয়ে কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।</div>
   <form id="aiForm" autocomplete="off">
     <input id="aiInput" type="text" maxlength="500" placeholder="Ask a question…" aria-label="Your question">
@@ -11655,11 +11671,28 @@ function ovEnsureThreshold(){
     return d;
   }
   function setBusy(b){ busy = b; sendBtn.disabled = b; }
+  // Only signed-in customers can chat. Signed-out visitors see a sign-in prompt instead (the server checks this too, so hiding is only for looks).
+  function loggedIn(){ return !!(window.__aiAuth && window.__aiAuth.loggedIn()); }
+  var wasIn = null, authTimer = 0;
+  function syncAuth(){
+    var inNow = loggedIn();
+    panel.classList.toggle("loggedout", !inNow);
+    if(wasIn === true && !inNow){ log.innerHTML = ""; history = []; }       // signed out: the conversation is wiped from this page
+    wasIn = inNow;
+    if(inNow && panel.classList.contains("open") && !log.children.length) addBubble("bot", greeting);
+    return inNow;
+  }
   function setOpen(open){
     panel.classList.toggle("open", open);
     fab.setAttribute("aria-expanded", open ? "true" : "false");
-    if(open){ if(!log.children.length) addBubble("bot", greeting); setTimeout(function(){ try{ input.focus(); }catch(e){} }, 50); }
+    clearInterval(authTimer); authTimer = 0;
+    if(open){
+      var inNow = syncAuth();
+      authTimer = setInterval(syncAuth, 1000);                                // notices signing in/out while the window is open
+      setTimeout(function(){ try{ (inNow ? input : document.getElementById("aiLoginBtn")).focus(); }catch(e){} }, 50);
+    }
   }
+  document.getElementById("aiLoginBtn").addEventListener("click", function(){ setOpen(false); if(window.__aiAuth) window.__aiAuth.signIn(); });
 
   // keep the button just above the Customer Service button when that one is showing, and low when it is hidden
   var panelBottom = 120;
@@ -11707,6 +11740,7 @@ function ovEnsureThreshold(){
   form.addEventListener("submit", async function(e){
     e.preventDefault();
     if(busy) return;
+    if(!syncAuth()) return;
     var text = input.value.replace(/\s+/g, " ").trim();
     if(!text) return;
     input.value = "";
@@ -11717,9 +11751,12 @@ function ovEnsureThreshold(){
     var ac = new AbortController();
     var timer = setTimeout(function(){ ac.abort(); }, 30000);
     try{
+      var token = await window.__aiAuth.token();
+      var headers = { "Content-Type": "application/json" };
+      if(token) headers["Authorization"] = "Bearer " + token;
       var res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify({ messages: history.slice(-12) }),
         signal: ac.signal
       });
@@ -11732,7 +11769,8 @@ function ovEnsureThreshold(){
         wait.className = "aiMsg err";
         wait.textContent = (data && typeof data.message === "string" && data.message) ? data.message : FALLBACK_ERR;
         history.pop();                    // the unanswered question is not kept, so the next message starts cleanly
-        if(data && data.error === "disabled") fab.classList.remove("ready");   // the admin turned it off while this page was open
+        if(data && data.error === "disabled") fab.classList.remove("ready");
+        if(data && data.error === "login_required") syncAuth();   // the admin turned it off while this page was open
       }
     }catch(err){
       wait.className = "aiMsg err";

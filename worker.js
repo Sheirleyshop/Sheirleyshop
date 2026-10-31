@@ -78,6 +78,9 @@ const MSG_BUSY = "The assistant is busy right now. Please try again in a moment.
 const MSG_DOWN = "The assistant is not available right now. Please use the customer service chat. / অ্যাসিস্ট্যান্ট এখন পাওয়া যাচ্ছে না, অনুগ্রহ করে কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।";
 const MSG_SLOW = "You are sending messages too quickly. Please wait a little. / আপনি খুব দ্রুত মেসেজ পাঠাচ্ছেন, একটু অপেক্ষা করুন।";
 const MSG_OFF = "The assistant is switched off right now. Please use the customer service chat. / অ্যাসিস্ট্যান্ট এখন বন্ধ আছে, অনুগ্রহ করে কাস্টমার সার্ভিস চ্যাটে মেসেজ দিন।";
+const MSG_LOGIN = "Please sign in to your account to chat with the assistant. / অ্যাসিস্ট্যান্টের সাথে কথা বলতে আপনার অ্যাকাউন্টে সাইন ইন করুন।";
+const MSG_VERIFY = "Please verify your email first, then try again. / আগে আপনার ইমেইল ভেরিফাই করুন, তারপর আবার চেষ্টা করুন।";
+const MSG_NOT_ALLOWED = "Your account can't use the assistant right now. Please contact us through Customer Service. / আপনার অ্যাকাউন্ট দিয়ে এখন অ্যাসিস্ট্যান্ট ব্যবহার করা যাচ্ছে না।";
 const MSG_BLOCKED ="Sorry, I can't help with that one. I'm happy to help with our products, delivery or payment. / দুঃখিত, এটি নিয়ে সাহায্য করতে পারছি না। আমাদের পণ্য, ডেলিভারি বা পেমেন্ট নিয়ে প্রশ্ন করতে পারেন।";
 
 function jsonResponse(status, body, extraHeaders){
@@ -329,6 +332,8 @@ function buildSystemPrompt(ctx){
     "- Many customers write Bangla in English letters (Banglish). Understand it fully and answer in the same style they used. Examples: \"dam koto\" / \"price koto\" / \"koto taka\" = how much is it; \"stock ache?\" / \"ache ki?\" = is it available; \"delivery koto din lagbe\" = how many days for delivery; \"delivery charge koto\" = delivery fee; \"kivabe order korbo\" = how do I order; \"kothay\" = where; \"return hobe?\" = can I return it. If a message does not say which product, ask which one they mean.",
     "- Use plain text only: no markdown, no asterisks, no tables. A short list may use a dash at the start of each line.",
     "- Answer ONLY from the STORE INFORMATION below. Never invent prices, stock, discounts, delivery times, return or refund rules, or any policy that is not written there. If the answer is not there, say you are not sure and suggest the customer message the team through the customer service chat.",
+    "- You only write text. You are NOT connected to orders, accounts, stock or prices, so you can NOT place, change, cancel, track, refund or confirm any order, apply a coupon or points, or change anything on the shop. Never say or imply that you did. If asked, explain how the customer does it themselves (Add to Cart / Buy Now on the product, Track Order, or the Customer Service chat).",
+    "- Be exact about products. Use the exact product name and the exact price (with ৳) written in STORE INFORMATION. If several products fit the question, list each with its own price. If a product is not in STORE INFORMATION, say you do not see it listed and suggest Customer Service. Say clearly when a product is out of stock. Never guess, round, estimate or invent a name, price, size, colour or stock number.",
     "- You cannot see or change orders, accounts, points balances or payments. For order status, tell the customer to use Track Order. For anything personal or urgent, tell them to message the team.",
     "- Never give, guess or repeat any payment number or account detail. Payment numbers and the payment steps are shown on the checkout page.",
     "- You cannot place orders. To buy, the customer taps Add to Cart or Buy Now on the product.",
@@ -413,6 +418,50 @@ async function askAnyAi(env, system, contents){
   return { fail: anyBusy ? "busy" : "down" };
 }
 
+/* ---------- only signed-in customers may use the assistant ---------- */
+// The page sends the customer's login token. We ask Supabase (the same service that logged them in) whether it is real,
+// and read their own profile with that token. If we cannot confirm it, we say no ("fail closed").
+const CUSTOMER_TTL_MS = 60 * 1000;
+const customerCache = new Map();    // token -> { id, until }
+function bearerToken(request){
+  const auth = request.headers.get("Authorization") || "";
+  return /^Bearer\s+[A-Za-z0-9._\-]{20,4000}$/.test(auth) ? auth.slice(7).trim() : "";
+}
+async function verifyCustomer(token){
+  if(!token) return { reason: "login_required" };
+  const now = Date.now();
+  const hit = customerCache.get(token);
+  if(hit && hit.until > now) return { id: hit.id };
+  const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + token, "Accept": "application/json" };
+  try{
+    const u = await fetch(SUPABASE_URL + "/auth/v1/user", { headers });
+    if(u.status === 401 || u.status === 403) return { reason: "login_required" };
+    if(!u.ok) return { reason: "unavailable" };
+    const user = await u.json();
+    if(!user || typeof user.id !== "string") return { reason: "login_required" };
+    if(!user.email_confirmed_at && !user.confirmed_at) return { reason: "verify_required" };
+    const p = await fetch(SUPABASE_URL + "/rest/v1/profiles?select=role,status,blocked_until&id=eq." + encodeURIComponent(user.id), { headers });
+    if(!p.ok) return { reason: "unavailable" };
+    const rows = await p.json();
+    const prof = Array.isArray(rows) ? rows[0] : null;
+    if(!prof || prof.role !== "customer") return { reason: "not_allowed" };
+    const until = prof.blocked_until ? Date.parse(prof.blocked_until) : 0;
+    if(prof.status === "blocked_permanent" || (prof.status === "blocked_temp" && until > now)) return { reason: "not_allowed" };
+    if(customerCache.size > 500) customerCache.clear();
+    customerCache.set(token, { id: user.id, until: now + CUSTOMER_TTL_MS });
+    return { id: user.id };
+  }catch(e){
+    console.error("[chat] could not check the login:", e && e.message);
+    return { reason: "unavailable" };
+  }
+}
+const LOGIN_FAIL = {
+  login_required: [401, MSG_LOGIN],
+  verify_required: [403, MSG_VERIFY],
+  not_allowed: [403, MSG_NOT_ALLOWED],
+  unavailable: [503, MSG_DOWN]
+};
+
 async function handleChat(request, env){
   if(request.method !== "POST") return jsonResponse(405, { error: "method_not_allowed" }, { "Allow": "POST" });
 
@@ -440,6 +489,14 @@ async function handleChat(request, env){
   try{ body = JSON.parse(raw); }catch(e){ return jsonResponse(400, { error: "invalid_json" }); }
   const parsed = parseMessages(body);
   if(parsed.error) return jsonResponse(400, { error: "invalid_request", message: parsed.error });
+
+  const who = await verifyCustomer(bearerToken(request));
+  if(!who.id){
+    const f = LOGIN_FAIL[who.reason] || LOGIN_FAIL.login_required;
+    return jsonResponse(f[0], { error: who.reason || "login_required", message: f[1] });
+  }
+  const accountWait = localWaitSeconds("u:" + who.id);   // each account also has its own per-minute limit
+  if(accountWait) return jsonResponse(429, { error: "rate_limited", message: MSG_SLOW }, { "Retry-After": String(accountWait) });
 
   const ctx = await loadStoreContext();
   if(ctx.ok && ctx.ai.enabled === false) return jsonResponse(503, { error: "disabled", message: MSG_OFF });   // switched off in Dashboard → Settings
