@@ -12,7 +12,9 @@
   },
   // Limits for the AI assistant at /api/chat (per visitor address). Cloudflare applies each one per location, and
   // worker.js also keeps its own backstop limit, so the assistant is never left unprotected.
-  // The Gemini key is NOT here: it stays in Cloudflare as the secret GEMINI_API_KEY.
+  // No AI key is here: the Groq key stays in Cloudflare as the secret GROQ_API_KEY.
+  // Cloudflare's own AI (free allowance, no key). The Worker uses it first and Groq as the backup.
+  "ai": { "binding": "AI" },
   "ratelimits": [
     { "name": "CHAT_BURST_LIMITER",  "namespace_id": "7301", "simple": { "limit": 3,   "period": 10 } },
     { "name": "CHAT_MINUTE_LIMITER", "namespace_id": "7302", "simple": { "limit": 12,  "period": 60 } },

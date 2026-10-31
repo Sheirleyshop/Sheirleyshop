@@ -46,26 +46,29 @@ async function getShareImage(ctx){
 /* =====================================================================================================
    SHEIRLEY AI assistant: POST /api/chat
    -----------------------------------------------------------------------------------------------------
-   - The Gemini key lives only in the Cloudflare secret GEMINI_API_KEY (env.GEMINI_API_KEY). It is never sent
+   - The AI keys live only in Cloudflare (secret GROQ_API_KEY; Cloudflare's own AI needs no key, it is the AI binding). They are never sent
      to the browser, never written into a file, and never put in a web address (it travels in a request header).
    - The shop page only ever talks to this Worker (same website address), never to Google directly.
    - Public shop facts (FAQs, delivery charges, payment METHOD NAMES, products) are read from Supabase with the
      same public key the shop page already uses, so answers come from your real, current data.
      Nothing private is read: no orders, customers, chats, payment numbers or staff details.
-   - Safety: same-site requests only, size and format checks, rate limits, a time limit on Gemini, and
+   - Safety: same-site requests only, size and format checks, rate limits, a time limit on each AI, and
      friendly errors that never reveal internal details.
    ===================================================================================================== */
 
 const CHAT_PATH = "/api/chat";
 const CONFIG_PATH = "/api/chat/config";
-const GEMINI_MODEL = "gemini-3.8-flash";        // to switch model later, change only this line
-const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent";
-const GEMINI_TIMEOUT_MS = 20000;
-const MAX_OUTPUT_TOKENS = 2048;     // generous on purpose: Gemini counts its internal "thinking" inside this limit
+// The AIs, tried in this order. If one is out of free allowance or down, the next one answers.
+// To change a model, or to swap one AI for another, edit only this block.
+const WORKERS_AI_MODEL = "@cf/google/gemma-4-26b-a4b-it";   // Cloudflare's own AI: no key needed (the "AI" binding in wrangler.jsonc)
+const GROQ_MODEL = "llama-3.3-70b-versatile";                // Groq: needs the secret GROQ_API_KEY
+const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
+const AI_TIMEOUT_MS = 20000;
+const MAX_OUTPUT_TOKENS = 700;      // longest answer; Bangla letters use more tokens, so this is roomy
 const MAX_BODY_BYTES = 24 * 1024;   // Bangla letters take 3 bytes each, so this is roomy but still small
 const MAX_USER_CHARS = 500;         // longest single customer message
 const MAX_REPLY_CHARS_IN_HISTORY = 1200;
-const MAX_HISTORY = 10;             // newest messages sent to Gemini
+const MAX_HISTORY = 10;             // newest messages sent to the AI
 const MAX_MESSAGES_ACCEPTED = 40;
 const CONTEXT_TTL_MS = 5 * 60 * 1000;
 const MAX_PRODUCTS_IN_PROMPT = 60;
@@ -162,7 +165,7 @@ function parseMessages(body){
   while(recent.length && recent[0].role !== "user") recent.shift();
   if(!recent.length || recent[recent.length - 1].role !== "user") return { error: "The last message must come from the customer." };
   const contents = [];
-  for(const m of recent){          // Gemini wants user/model turns; join neighbours that share a role
+  for(const m of recent){          // the AI wants alternating user/assistant turns; join neighbours that share a role
     const last = contents[contents.length - 1];
     if(last && last.role === m.role) last.parts[0].text += "\n" + m.text;
     else contents.push({ role: m.role, parts: [{ text: m.text }] });
@@ -338,30 +341,75 @@ function buildSystemPrompt(ctx){
   return rules.join("\n");
 }
 
-/* ---------- Gemini ---------- */
-let geminiExtras = true;   // low "thinking" level + do-not-store flag; switched off automatically if Google rejects them
-
-async function callGemini(env, system, contents){
-  const attempts = geminiExtras ? [true, false] : [false];
-  let last = null;
-  for(const extras of attempts){
-    const payload = { systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS } };
-    if(extras){ payload.generationConfig.thinkingConfig = { thinkingLevel: "low" }; payload.store = false; }
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), GEMINI_TIMEOUT_MS);
-    try{
-      const r = await fetch(GEMINI_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-        body: JSON.stringify(payload),
-        signal: ac.signal
-      });
-      if(r.status === 400 && extras){ last = r; continue; }      // maybe the optional fields were refused: retry plain
-      if(r.ok && !extras && attempts.length === 2) geminiExtras = false;
-      return r;
-    }finally{ clearTimeout(timer); }
+/* ---------- the AIs (Cloudflare AI first, Groq as backup) ---------- */
+function toChatMessages(system, contents){
+  const out = [{ role: "system", content: system }];
+  for(const c of contents) out.push({ role: c.role === "model" ? "assistant" : "user", content: c.parts[0].text });
+  return out;
+}
+function textFromReply(j){
+  if(!j || typeof j !== "object") return "";
+  const r = j.result && typeof j.result === "object" ? j.result : j;
+  if(typeof r.response === "string") return r.response;
+  const c = r.choices && r.choices[0];
+  const t = c && c.message && c.message.content;
+  if(typeof t === "string") return t;
+  if(Array.isArray(t)) return t.map(p => (p && typeof p.text === "string" ? p.text : "")).join("");
+  return "";
+}
+function withTimeout(promise, ms){
+  let timer;
+  const t = new Promise((_, rej) => { timer = setTimeout(() => rej(Object.assign(new Error("timeout"), { name: "AbortError" })), ms); });
+  return Promise.race([promise, t]).finally(() => clearTimeout(timer));
+}
+// Each function returns { text } on success, or { fail: "busy" | "down" } so the next AI can be tried.
+async function askWorkersAi(env, messages){
+  try{
+    const out = await withTimeout(env.AI.run(WORKERS_AI_MODEL, { messages, max_tokens: MAX_OUTPUT_TOKENS, temperature: 0.4 }), AI_TIMEOUT_MS);
+    const text = textFromReply(out).trim();
+    return text ? { text } : { fail: "down", why: "empty" };
+  }catch(e){
+    const msg = String(e && e.message || e);
+    const busy = /429|3040|capacity|limit|quota|neuron/i.test(msg);
+    return { fail: busy ? "busy" : "down", why: oneLine(msg, 160) };
   }
-  return last;
+}
+async function askGroq(env, messages){
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), AI_TIMEOUT_MS);
+  try{
+    const r = await fetch(GROQ_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + env.GROQ_API_KEY },
+      body: JSON.stringify({ model: GROQ_MODEL, messages, max_tokens: MAX_OUTPUT_TOKENS, temperature: 0.4 }),
+      signal: ac.signal
+    });
+    if(!r.ok){
+      let detail = ""; try{ const j = await r.json(); detail = oneLine(j && j.error && j.error.message, 160); }catch(e){}
+      return { fail: (r.status === 429 || r.status === 503) ? "busy" : "down", why: r.status + " " + detail };
+    }
+    const text = textFromReply(await r.json()).trim();
+    return text ? { text } : { fail: "down", why: "empty" };
+  }catch(e){
+    return { fail: "down", why: e && e.name === "AbortError" ? "timeout" : oneLine(e && e.message, 160) };
+  }finally{ clearTimeout(timer); }
+}
+function availableAis(env){
+  const list = [];
+  if(env.AI && typeof env.AI.run === "function") list.push({ name: "cloudflare", ask: askWorkersAi });
+  if(env.GROQ_API_KEY) list.push({ name: "groq", ask: askGroq });
+  return list;
+}
+async function askAnyAi(env, system, contents){
+  const messages = toChatMessages(system, contents);
+  let anyBusy = false;
+  for(const ai of availableAis(env)){
+    const r = await ai.ask(env, messages);
+    if(r.text) return { text: r.text, by: ai.name };
+    console.error("[chat] " + ai.name + " failed:", r.fail, r.why || "");
+    if(r.fail === "busy") anyBusy = true;
+  }
+  return { fail: anyBusy ? "busy" : "down" };
 }
 
 async function handleChat(request, env){
@@ -380,8 +428,8 @@ async function handleChat(request, env){
   const wait = await rateLimitWaitSeconds(env, ip);
   if(wait) return jsonResponse(429, { error: "rate_limited", message: MSG_SLOW }, { "Retry-After": String(wait) });
 
-  if(!env.GEMINI_API_KEY){
-    console.error("[chat] GEMINI_API_KEY is not set on this Worker");
+  if(!availableAis(env).length){
+    console.error("[chat] no AI is set up on this Worker (no AI binding and no GROQ_API_KEY)");
     return jsonResponse(503, { error: "not_configured", message: MSG_DOWN });
   }
 
@@ -396,33 +444,13 @@ async function handleChat(request, env){
   if(ctx.ok && ctx.ai.enabled === false) return jsonResponse(503, { error: "disabled", message: MSG_OFF });   // switched off in Dashboard → Settings
   const system = buildSystemPrompt(ctx);
 
-  let r;
-  try{
-    r = await callGemini(env, system, parsed.contents);
-  }catch(e){
-    const timedOut = e && e.name === "AbortError";
-    console.error("[chat] gemini request failed:", timedOut ? "timeout" : (e && e.message));
-    return jsonResponse(timedOut ? 504 : 502, { error: timedOut ? "timeout" : "ai_unavailable", message: timedOut ? MSG_BUSY : MSG_DOWN });
+  const got = await askAnyAi(env, system, parsed.contents);
+  if(got.fail){
+    return got.fail === "busy"
+      ? jsonResponse(503, { error: "busy", message: MSG_BUSY }, { "Retry-After": "20" })
+      : jsonResponse(502, { error: "ai_unavailable", message: MSG_DOWN });
   }
-
-  if(!r.ok){
-    let detail = "";
-    try{ const j = await r.json(); detail = oneLine(j && j.error && j.error.message, 200); }catch(e){}
-    console.error("[chat] gemini returned", r.status, detail);
-    if(r.status === 429 || r.status === 503) return jsonResponse(503, { error: "busy", message: MSG_BUSY }, { "Retry-After": "20" });
-    return jsonResponse(502, { error: "ai_unavailable", message: MSG_DOWN });   // 400/401/403/404/5xx: our side to fix, see Worker logs
-  }
-
-  let data;
-  try{ data = await r.json(); }catch(e){ return jsonResponse(502, { error: "ai_unavailable", message: MSG_DOWN }); }
-  const cand = data && data.candidates && data.candidates[0];
-  const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
-  const reply = parts.filter(p => p && typeof p.text === "string" && !p.thought).map(p => p.text).join("").trim();
-  if(!reply){
-    const why = (data && data.promptFeedback && data.promptFeedback.blockReason) || (cand && cand.finishReason) || "empty";
-    console.error("[chat] no reply text, reason:", why);
-    return jsonResponse(200, { reply: MSG_BLOCKED, fallback: true });
-  }
+  const reply = got.text.trim();
   return jsonResponse(200, { reply: reply.slice(0, 2500) });
 }
 
@@ -433,7 +461,7 @@ async function handleConfig(request, env){
   const ctx = await loadStoreContext();
   const ai = ctx.ai || AI_DEFAULTS;
   return jsonResponse(200, {
-    enabled: ai.enabled !== false && !!env.GEMINI_API_KEY,   // no key on the Worker = nothing to offer, so the button stays hidden
+    enabled: ai.enabled !== false && availableAis(env).length > 0,   // no AI set up on the Worker = nothing to offer, so the button stays hidden
     name: ai.name,
     greeting: ai.greeting
   }, { "Cache-Control": "public, max-age=60" });
